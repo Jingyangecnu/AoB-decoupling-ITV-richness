@@ -5,14 +5,14 @@
 "PCA-axis (1-D) ITV","Aboveground","Above_PC2",0.0129,"Yes",0.9213
 "PCA-axis (1-D) ITV","Belowground","Below_PC1",0.1029,"No",0.2132
 "PCA-axis (1-D) ITV","Belowground","Below_PC2",0.0361,"Yes",0.9363
-"Single-trait ITV","Aboveground","LTO",0.0384,"Yes",0.2379
-"Single-trait ITV","Aboveground","MLA",0.7498,"No",1e-04
-"Single-trait ITV","Aboveground","SLA",0.1683,"No",0.0057
-"Single-trait ITV","Aboveground","LDMC",0.266,"No",0.4757
-"Single-trait ITV","Aboveground","SSD",1,"No",0.2776
-"Single-trait ITV","Aboveground","Chl",0.0142,"Yes",0.3217
-"Single-trait ITV","Aboveground","Height",1,"No",0.4839
-"Single-trait ITV","Belowground","SRL",0.0746,"No",0.1243
-"Single-trait ITV","Belowground","RD",0.9569,"No",0.0259
-"Single-trait ITV","Belowground","RTD",0.0168,"Yes",0.4595
-"Single-trait ITV","Belowground","SRA",1e-04,"Yes",0.4975
+"Single-trait ITV","Aboveground","LTO",0.0338,"Yes",0.2321
+"Single-trait ITV","Aboveground","MLA",0.7585,"No",1e-04
+"Single-trait ITV","Aboveground","SLA",0.1612,"No",0.0055
+"Single-trait ITV","Aboveground","LDMC",0.2629,"No",0.4928
+"Single-trait ITV","Aboveground","SSD",1,"No",0.2931
+"Single-trait ITV","Aboveground","Chl",0.0145,"Yes",0.3303
+"Single-trait ITV","Aboveground","Height",1,"No",0.5157
+"Single-trait ITV","Belowground","SRL",0.0835,"No",0.1183
+"Single-trait ITV","Belowground","RD",0.9729,"No",0.0276
+"Single-trait ITV","Belowground","RTD",0.0189,"Yes",0.4585
+"Single-trait ITV","Belowground","SRA",1e-04,"Yes",0.498
