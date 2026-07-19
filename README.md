@@ -15,7 +15,10 @@ vs belowground plant organs.
   - Fig. 4: Gini coefficient of biomass asymmetry
   - Fig. 5: Species-level mean trait value shifts along the richness gradient
   - Table S1: Aboveground vs belowground compartment interaction test
+  - Table S2: Composition random-effect LRT decisions (Fig. 1 and Fig. 2 metrics)
   - Fig. S1: PCA biplots (trait loadings)
+  - Fig. S2: Species-specific richness-ITV relationships (multidimensional and PCA-axis ITV)
+  - Fig. S3: Species-specific richness-ITV relationships (single-trait ITV)
   - Appendix: robustness checks (paired-organ intersection; pot-level subsampling)
 - `data/SeedlingTraitData.csv` — individual-seedling trait, biomass, and
   richness-treatment data underlying all analyses.
