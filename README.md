@@ -11,9 +11,10 @@ vs belowground plant organs.
   figures/tables and Fig. S1:
   - Fig. 1: Multidimensional ITV (TPD/FRic) and PCA-axis ITV, aboveground vs belowground
   - Fig. 2: Single-trait ITV (11 traits)
-  - Fig. 3: (a) Gini coefficient of biomass asymmetry; (b-c) within- vs
-    between-species biomass variance decomposition
-  - Fig. 4: Species-level mean trait value shifts along the richness gradient
+  - Fig. 3: Gini coefficient of biomass asymmetry
+  - Fig. 4: Within- vs between-species biomass variance decomposition,
+    aboveground and belowground shown as separate panels
+  - Fig. 5: Species-level mean trait value shifts along the richness gradient
   - Table S1: Aboveground vs belowground compartment interaction test
   - Table S2: Composition random-effect LRT decisions (Fig. 1 and Fig. 2 metrics)
   - Fig. S1: PCA biplots (trait loadings)
