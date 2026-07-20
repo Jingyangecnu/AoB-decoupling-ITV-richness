@@ -1,0 +1,1082 @@
+---
+title: "Decoupling of Aboveground and Belowground Intraspecific Trait Variation Along Richness Gradients in Plants"
+subtitle: "Public reproduction code: reads the standardized, outlier-removed individual-level dataset and PCA summary directly"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!--
+Fig 1: multidim + PCA-axis ITV | Fig 2: single-trait ITV | Fig 3: Gini coefficient
+Fig 4: within/between-species variance decomposition | Fig 5: mean trait shifts
+Table S1/S2 | Fig S1: PCA biplots | Fig S2/S3/Table S3: species slopes
+
+This version starts from data/SeedlingTraitData_public.csv and
+data/PCA_summary_public.csv instead of the private raw measurement file.
+Single-trait columns in the public data are already log10-transformed
+(where applicable) and z-standardized, and QC-flagged/dead individuals
+are already removed; PCA has already been run and its scores are
+included as columns (Above_PC1, Above_PC2, Below_PC1, Below_PC2), with
+loadings and variance-explained supplied separately for the Fig. S1
+biplot. Every figure and table below reproduces bit-for-bit from these
+two files. See prepare_public_data.R for how they were derived from the
+private raw dataset.
+-->
+
+# Setup
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+## Packages
+
+```{r packages}
+library(tidyverse)   # data wrangling + ggplot2
+library(lme4)        # mixed-effects models
+library(lmerTest)    # Satterthwaite P-values for lmer
+library(effects)     # allEffects()
+library(TPD)          # TPDs(), REND() for multidimensional ITV/FRic
+library(ineq)         # Gini coefficient
+library(patchwork)   # multi-panel assembly
+library(ggpubr)       # get_legend(), as_ggplot()
+library(ggthemes)     # theme_foundation()
+library(grid)
+library(MuMIn)         # r.squaredGLMM()
+library(eoffice)       # export to .pptx
+
+# effects loads MASS, which masks dplyr::select()/filter()
+select <- dplyr::select
+filter <- dplyr::filter
+```
+
+## Helper functions
+
+```{r helpers}
+# Bao's bias-corrected CV: single-trait ITV metric
+CV4 <- function(trait_sample) {
+  trait_sample <- trait_sample[!is.na(trait_sample)]
+  if (length(trait_sample) > 1) {
+    N <- length(trait_sample)
+    y_bar <- mean(trait_sample)
+    s2_hat <- var(trait_sample)
+    cv_2 <- s2_hat / y_bar^2
+    cv_1 <- sqrt(cv_2)
+    gamma_1 <- sum(((trait_sample - y_bar) / s2_hat^0.5)^3) / N   # skewness term
+    gamma_2 <- sum(((trait_sample - y_bar) / s2_hat^0.5)^4) / N   # kurtosis term
+    bias2 <- cv_1^3 / N - cv_1 / 4 / N - cv_1^2 * gamma_1 / 2 / N - cv_1 * gamma_2 / 8 / N
+    cv4 <- cv_1 - bias2
+  } else {
+    cv4 <- NA
+  }
+  return(cv4)
+}
+
+# Rarefied ITV: resample to fixed N (999x) for comparability across group sizes
+Sample_CV <- function(data, N) {
+  if (length(data) <= N) {
+    cv4.mean <- CV4(data)
+  } else {
+    cv <- replicate(999, CV4(sample(data, N)))
+    cv4.mean <- mean(cv)
+  }
+  return(cv4.mean)
+}
+
+# Min-max normalization to [0, 1], applied before single-trait ITV
+normalize_0_1 <- function(df, columns) {
+  for (col_name in columns) {
+    min_val <- min(df[[col_name]], na.rm = TRUE)
+    max_val <- max(df[[col_name]], na.rm = TRUE)
+    df[[col_name]] <- (df[[col_name]] - min_val) / (max_val - min_val)
+  }
+  return(df)
+}
+
+# LRT-based selection of the (1|CRichGroup) composition random effect:
+# keep it only if it significantly improves fit over species-only.
+select_richness_re <- function(data, response, sp_var = "sp", comp_var = "CRichGroup",
+                                richness_term = "log(Richness)", lrt_alpha = 0.05) {
+  f_full    <- as.formula(paste(response, "~", richness_term, "+ (1 |", sp_var, ") + (1 |", comp_var, ")"))
+  f_reduced <- as.formula(paste(response, "~", richness_term, "+ (1 |", sp_var, ")"))
+  # do.call() avoids the lme4 parent.frame() lookup bug inside nested functions
+  m_full_ml    <- do.call(lmer, list(formula = f_full, data = data, REML = FALSE))
+  m_reduced_ml <- do.call(lmer, list(formula = f_reduced, data = data, REML = FALSE))
+  lrt_p <- tryCatch(anova(m_full_ml, m_reduced_ml)[2, "Pr(>Chisq)"], error = function(e) NA_real_)
+  use_composition <- !is.na(lrt_p) && lrt_p < lrt_alpha
+  re_part <- if (use_composition) paste("(1 |", sp_var, ") + (1 |", comp_var, ")") else paste("(1 |", sp_var, ")")
+  list(
+    formula = as.formula(paste(response, "~", richness_term, "+", re_part)),
+    null_formula = as.formula(paste(response, "~", re_part)),
+    used_composition = use_composition,
+    lrt_p = lrt_p
+  )
+}
+
+sp_colors <- c(
+  "#5dc1a2", "#13815e", "#e4d79a", "#f54343",
+  "#7e0d13", "#1b7c88", "#f7961e", "#5f7385",
+  "#ff9999", "#66b3ff")
+
+theme_Publication <- function(base_size = 10, base_family = "sans") {
+  (theme_foundation(base_size = base_size, base_family = base_family)
+   + theme(plot.title = element_text(face = "bold", size = rel(1.33), hjust = -0.05),
+           text = element_text(size = base_size),
+           panel.background = element_rect(fill = "white", colour = NA),
+           plot.background = element_rect(fill = "white", colour = NA),
+           panel.border = element_rect(colour = NA),
+           axis.title = element_text(size = base_size + 1),
+           axis.title.y = element_text(angle = 90, vjust = 2),
+           axis.title.x = element_text(vjust = -0.2),
+           axis.text = element_text(size = base_size),
+           axis.line = element_line(colour = "black"),
+           axis.ticks = element_line(),
+           panel.grid.major = element_blank(),
+           panel.grid.minor = element_blank(),
+           legend.key = element_rect(colour = NA),
+           legend.position = "bottom",
+           legend.direction = "horizontal",
+           legend.key.size = unit(0.2, "cm"),
+           legend.margin = ggplot2::margin(0, 0, 0, 0, "mm"),
+           legend.title = element_text(size = base_size),
+           plot.margin = unit(c(10, 5, 5, 5), "mm"),
+           strip.background = element_rect(colour = "#f0f0f0", fill = "#f0f0f0"),
+           strip.text = element_text(face = "bold")
+   ))
+}
+
+# Common ggplot style layer reused by the ITV figures (species-colored points)
+common_style <- list(
+  theme_Publication(base_size = 10),
+  scale_color_manual(values = sp_colors),
+  scale_fill_manual(values = sp_colors),
+  guides(color = guide_legend(title = "Species", title.position = "left", nrow = 1),
+         fill = guide_legend(title = "Species", title.position = "left", nrow = 1)),
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.key.size = unit(0.5, "cm"),
+    legend.spacing.x = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", hjust = 0.5),
+    legend.text = element_text(size = 9, face = "italic"),
+    plot.title = element_text(hjust = 0.5, size = 11, face = "bold"),
+    axis.title = element_text(size = 11, face = "plain"),
+    axis.text = element_text(size = 9, face = "plain", color = "black"),
+    axis.text.y = element_text(angle = 90, hjust = 0.5),
+    plot.margin = margin(10, 10, 10, 10, "pt")
+  )
+)
+
+compartment_colors <- c("Aboveground" = "#2F7F6F", "Belowground" = "#9C6B2F")
+
+# Significance threshold for the richness fixed effect (P < 0.1)
+SIG_ALPHA <- 0.1
+
+# Shared y-axis label for ITV figures (only shown on the middle-row left panel)
+ITV_YLAB <- "Intraspecific trait variability (ITV)"
+
+# Plotmath-parseable "p = 0.028" / "p < 0.001" label (italic p, 3 decimals)
+format_p_label <- function(p_value) {
+  if (p_value < 0.001) 'paste(italic(p), " < 0.001")' else sprintf('paste(italic(p), " = %.3f")', p_value)
+}
+
+# Plotmath-parseable "Name: Slope = 0.067, p = 0.028" label (italic Slope/p)
+format_slope_p_label <- function(name, slope, p_value, suffix = "") {
+  p_part <- if (p_value < 0.001) '\", \", italic(p), " < 0.001"' else sprintf('\", \", italic(p), " = %.3f"', p_value)
+  suffix_part <- if (nzchar(suffix)) sprintf(', "%s"', suffix) else ""
+  name_part <- if (nzchar(name)) sprintf('"%s: ", ', name) else ""
+  sprintf('paste(%sitalic(Slope), " = %.3f", %s%s)', name_part, slope, p_part, suffix_part)
+}
+
+# PCA biplot: scores + trait loading arrows (Fig. S1). Loadings/variance-explained
+# come from the precomputed pca_summary table rather than a live principal() fit.
+plot_PCA_biplot <- function(point.pca, pca_loadings, x_col, y_col, scale_factor = 2) {
+  axis.pca <- pca_loadings %>%
+    transmute(Trait, v1 = scale_factor * PC1_loading, v2 = scale_factor * PC2_loading)
+
+  pc1_explained <- round(100 * pca_loadings$PC1_PropVar[1], 1)
+  pc2_explained <- round(100 * pca_loadings$PC2_PropVar[1], 1)
+
+  ggplot(point.pca, aes(x = .data[[x_col]], y = .data[[y_col]])) +
+    geom_point(aes(color = sp), size = 1.5, alpha = 0.5) +
+    xlab(paste0("PC1 (", pc1_explained, "%)")) +
+    ylab(paste0("PC2 (", pc2_explained, "%)")) +
+    geom_segment(data = axis.pca, aes(x = 0, y = 0, xend = v1, yend = v2),
+                 arrow = arrow(length = unit(0.2, "cm")), alpha = 0.9, color = "black", linewidth = 1) +
+    geom_text(data = axis.pca, aes(v1, v2, label = Trait), size = 4.5,
+              nudge_x = ifelse(axis.pca$v1 > 0, 0.2, -0.2),
+              nudge_y = ifelse(axis.pca$v2 > 0, 0.2, -0.2)) +
+    theme_Publication() +
+    theme(legend.text = element_text(face = "italic"), legend.position = "none") +
+    scale_colour_manual(values = sp_colors) +
+    scale_fill_manual(values = sp_colors)
+}
+
+```
+
+# Data import
+
+```{r data-import}
+# Individual-level data: single traits are already log10-transformed (where
+# applicable) and z-standardized, QC-flagged measurements and dead/replaced
+# individuals are already removed, and PCA axis scores are already attached.
+# See prepare_public_data.R (not part of this public pipeline) for how this
+# file and the PCA summary below were derived from the private raw dataset.
+tda <- read.csv("data/SeedlingTraitData_public.csv", header = TRUE)
+tda$sp <- factor(tda$sp, levels = sort(unique(tda$sp)))
+
+pca_summary <- read.csv("data/PCA_summary_public.csv", header = TRUE)
+
+above_traits <- c("LTO", "MLA", "SLA", "LDMC", "SSD", "Chl", "Height")
+fineroot_traits <- c("SRL", "RD", "RTD", "SRA")
+single_traits <- c(above_traits, fineroot_traits)
+pca_traits <- c("Above_PC1", "Above_PC2", "Below_PC1", "Below_PC2")
+
+# Above/below trait tables; NA dropped per organ independently (see Appendix)
+above.tda <- na.omit(tda[, colnames(tda) %in% c(
+  "Comp", "Richness", "CRichGroup", "Group", "mean_phydist", "pot_number",
+  "sp", "ind_ID", "pot_ID", "sp_group", above_traits, "Above_PC1", "Above_PC2")])
+below.tda <- na.omit(tda[, colnames(tda) %in% c(
+  "Comp", "Richness", "CRichGroup", "Group", "mean_phydist", "pot_number",
+  "sp", "ind_ID", "pot_ID", "sp_group", fineroot_traits, "Below_PC1", "Below_PC2")])
+
+# Unique "population" ID = species x richness-composition treatment, the unit
+# over which ITV is computed
+above.tda$Population <- factor(paste(above.tda$CRichGroup, above.tda$sp),
+                                levels = sort(unique(paste(above.tda$CRichGroup, above.tda$sp))))
+below.tda$Population <- factor(paste(below.tda$CRichGroup, below.tda$sp),
+                                levels = sort(unique(paste(below.tda$CRichGroup, below.tda$sp))))
+
+pop_info_above <- above.tda %>%
+  group_by(Population) %>%
+  summarise(Richness = mean(Richness, na.rm = TRUE), mean_phydist = mean(mean_phydist, na.rm = TRUE),
+            sample_size = n(), sp = unique(sp)[1], CRichGroup = unique(CRichGroup)[1], .groups = "drop")
+pop_info_below <- below.tda %>%
+  group_by(Population) %>%
+  summarise(Richness = mean(Richness, na.rm = TRUE), mean_phydist = mean(mean_phydist, na.rm = TRUE),
+            sample_size = n(), sp = unique(sp)[1], CRichGroup = unique(CRichGroup)[1], .groups = "drop")
+
+cat("Aboveground PCA loadings:\n")
+print(pca_summary %>% filter(Compartment == "Aboveground") %>% select(-Compartment), row.names = FALSE)
+cat("\nBelowground PCA loadings:\n")
+print(pca_summary %>% filter(Compartment == "Belowground") %>% select(-Compartment), row.names = FALSE)
+```
+
+# Figure 1
+
+```{r fig1-tpd-function}
+# TPD/FRic calculator (1-D or 2-D): multidimensional ITV metric
+cal_TPD_var <- function(input_tda, pop_info, trait, trait.name) {
+  if (!all(trait %in% colnames(input_tda))) stop("Specified traits not found in the dataset")
+  kernel.populations <- TPDs(traits = input_tda[, trait, drop = FALSE], species = input_tda$Population)
+  functional.indices.populations <- REND(TPDs = kernel.populations)
+  population.level <- data.frame(
+    trait = trait.name,
+    Population = names(functional.indices.populations$species$FRichness),
+    Intra_FRic = functional.indices.populations$species$FRichness
+  )
+  merge(pop_info, population.level, by = "Population")
+}
+```
+
+## Panel (a-b): 2-D multidimensional ITV (PC1 + PC2 jointly)
+
+```{r fig1-2d}
+aboveTPD_FD <- cal_TPD_var(above.tda, pop_info_above, c("Above_PC1", "Above_PC2"), "Aboveground")
+belowTPD_FD <- cal_TPD_var(below.tda, pop_info_below, c("Below_PC1", "Below_PC2"), "Belowground")
+
+# Loop at top level (not inside a function) to avoid lme4's parent.frame() bug
+multidim_groups <- list(Aboveground = aboveTPD_FD, Belowground = belowTPD_FD)
+multidim_plots <- list()
+re_selection_log_multidim <- list()
+
+for (group_label in names(multidim_groups)) {
+  data_group <- multidim_groups[[group_label]]
+  data_group <- data_group[!is.na(data_group$Intra_FRic), ]
+
+  sel <- select_richness_re(data_group, "Intra_FRic")
+  model <- do.call(lmer, list(formula = sel$formula, data = data_group, REML = TRUE))
+  eff <- allEffects(model)$`log(Richness)`
+  effect_data <- data.frame(Richness = eff$x[, 1], value = eff$fit, upper = eff$upper, lower = eff$lower)
+  p_value <- summary(model)$coefficients["log(Richness)", "Pr(>|t|)"]
+  re_selection_log_multidim[[group_label]] <- data.frame(Panel = group_label, used_CRichGroup = sel$used_composition,
+                                                           lrt_p = sel$lrt_p, richness_p = p_value)
+  is_significant <- p_value < SIG_ALPHA
+  p_label <- format_p_label(p_value)
+  y_range <- range(c(data_group$Intra_FRic, effect_data$upper, effect_data$lower), na.rm = TRUE)
+  p_y <- y_range[1] + 0.9 * diff(y_range)
+  panel_letter <- c(Aboveground = "a", Belowground = "b")[group_label]
+
+  multidim_plots[[group_label]] <- ggplot() +
+    geom_jitter(data = data_group, aes(x = log(Richness), y = Intra_FRic, color = sp),
+                width = 0.1, shape = 16, size = 2.5, alpha = 0.6) +
+    geom_ribbon(data = effect_data, aes(x = log(Richness), ymin = lower, ymax = upper),
+                fill = "black", alpha = 0.15, linewidth = 0) +
+    geom_line(data = effect_data, aes(x = log(Richness), y = value),
+              color = "black", linewidth = 1.2, linetype = ifelse(is_significant, "solid", "dashed")) +
+    annotate("text", x = max(log(effect_data$Richness)), y = p_y, label = p_label,
+             hjust = 1, vjust = 0, size = 10/.pt, parse = TRUE) +
+    common_style + ylab(ITV_YLAB) +
+    xlab(if (panel_letter %in% c("a", "b")) NULL else "Richness") +
+    ggtitle(paste0("(", panel_letter, ") ", group_label)) +
+    theme(plot.title = element_text(hjust = 0, face = "bold")) +
+    scale_x_continuous(breaks = log(c(1, 2, 4, 8)), labels = c(1, 2, 4, 8))
+}
+
+cat("Random-effects structure selected per panel (Fig. 1a-b):\n")
+print(do.call(rbind, re_selection_log_multidim), row.names = FALSE)
+
+# Only the middle row (c) carries the shared y-axis label text; every panel
+# keeps its own tick numbers (scales differ by row)
+p_multidim_above <- multidim_plots[["Aboveground"]] +
+  theme(axis.title.y = element_blank())
+p_multidim_below <- multidim_plots[["Belowground"]] +
+  theme(axis.title.y = element_blank())
+```
+
+## Panel (c-f): 1-D ITV computed separately on PC1 and PC2
+
+```{r fig1-1d}
+get_pop_base <- function(df) {
+  df %>% group_by(Population) %>%
+    summarise(Richness = mean(Richness, na.rm = TRUE), mean_phydist = mean(mean_phydist, na.rm = TRUE),
+              sp = unique(sp), CRichGroup = unique(CRichGroup)[1], .groups = "drop")
+}
+pop_base_above <- get_pop_base(above.tda)
+pop_base_below <- get_pop_base(below.tda)
+
+cal_TPD_1D <- function(dataset, base_info, trait_col, label_name) {
+  kernel.pop <- TPDs(traits = dataset[, trait_col, drop = FALSE], species = dataset$Population)
+  indices <- REND(TPDs = kernel.pop)
+  res <- data.frame(Population = names(indices$species$FRichness), Intra_FRic = indices$species$FRichness, Trait = label_name)
+  merge(base_info, res, by = "Population")
+}
+
+all_results_list <- list(
+  "Above_PC1" = cal_TPD_1D(above.tda, pop_base_above, "Above_PC1", "Above_PC1"),
+  "Above_PC2" = cal_TPD_1D(above.tda, pop_base_above, "Above_PC2", "Above_PC2"),
+  "Below_PC1" = cal_TPD_1D(below.tda, pop_base_below, "Below_PC1", "Below_PC1"),
+  "Below_PC2" = cal_TPD_1D(below.tda, pop_base_below, "Below_PC2", "Below_PC2")
+)
+
+names_ordered <- c("Above_PC1", "Above_PC2", "Below_PC1", "Below_PC2")
+plot_list_fric <- list()
+re_selection_log_pcaxis <- list()
+for (k in seq_along(names_ordered)) {
+  trait_name <- names_ordered[k]
+  data.trait <- all_results_list[[trait_name]]
+  data.trait <- data.trait[data.trait$Richness > 0 & !is.na(data.trait$Richness), ]
+
+  sel <- select_richness_re(data.trait, "Intra_FRic")
+  model.fric <- do.call(lmer, list(formula = sel$formula, data = data.trait, REML = TRUE))
+  eff_obj <- allEffects(model.fric)[[1]]
+  effect_data <- data.frame(logRichness = log(eff_obj$x[, 1]), fit = eff_obj$fit, upper = eff_obj$upper, lower = eff_obj$lower)
+  p_value <- summary(model.fric)$coefficients["log(Richness)", "Pr(>|t|)"]
+  re_selection_log_pcaxis[[trait_name]] <- data.frame(Axis = trait_name, used_CRichGroup = sel$used_composition,
+                                                       lrt_p = sel$lrt_p, richness_p = p_value)
+  is_significant <- p_value < SIG_ALPHA
+  p_label <- format_p_label(p_value)
+  x_pos <- max(effect_data$logRichness, na.rm = TRUE)
+  y_range <- range(c(data.trait$Intra_FRic, effect_data$upper, effect_data$lower), na.rm = TRUE)
+  y_pos <- y_range[1] + 0.9 * diff(y_range)
+  panel_letter <- c(Above_PC1 = "c", Below_PC1 = "d", Above_PC2 = "e", Below_PC2 = "f")[trait_name]
+
+  p <- ggplot(effect_data, aes(x = logRichness, y = fit)) +
+    geom_jitter(data = data.trait, aes(x = log(Richness), y = Intra_FRic, color = sp), width = 0.1, shape = 16, size = 2.5, alpha = 0.6) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = "black", alpha = 0.15, linewidth = 0) +
+    geom_line(color = "black", linewidth = 1.2, linetype = ifelse(is_significant, "solid", "dashed")) +
+    annotate("text", x = x_pos, y = y_pos, label = p_label, hjust = 1, vjust = -0.5, size = 10/.pt, parse = TRUE) +
+    common_style + ggtitle(paste0("(", panel_letter, ") ", trait_name)) +
+    theme(plot.title = element_text(hjust = 0, face = "bold")) +
+    scale_x_continuous(labels = function(x) exp(x), breaks = log(c(1, 2, 4, 8))) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+    xlab(if (panel_letter %in% c("c", "d")) NULL else "Richness") + ylab(ITV_YLAB)
+
+  # Only panel c (row 2, the middle-left panel) keeps the shared y-axis
+  # title; every panel still shows its own tick numbers (scales differ).
+  if (panel_letter != "c") {
+    p <- p + theme(axis.title.y = element_blank())
+  }
+  plot_list_fric[[trait_name]] <- p
+}
+
+cat("Random-effects structure selected per axis (Fig. 1c-f):\n")
+print(do.call(rbind, re_selection_log_pcaxis), row.names = FALSE)
+```
+
+## Assemble Fig. 1 (2-D ITV | PC1 ITV | PC2 ITV rows, Above/Below columns)
+
+```{r fig1-assemble, fig.width=9, fig.height=11}
+fig1_layout <- "
+AB
+CD
+EF
+"
+
+fig1 <- wrap_plots(
+  A = p_multidim_above, B = p_multidim_below,
+  C = plot_list_fric[["Above_PC1"]], D = plot_list_fric[["Below_PC1"]],
+  E = plot_list_fric[["Above_PC2"]], F = plot_list_fric[["Below_PC2"]],
+  design = fig1_layout, guides = "collect"
+) &
+  theme(legend.position = "bottom", plot.margin = margin(3, 4, 3, 4, "pt"))
+
+print(fig1)
+
+ggsave("figures/Figure_1.pdf", plot = fig1, width = 170, height = 170, units = "mm", dpi = 600, device = "pdf")
+ggsave("figures/Figure_1.png", plot = fig1, width = 170, height = 170, units = "mm", dpi = 600, device = grDevices::png)
+topptx(fig1, filename = "figures/Figure_1.pptx", width = 170 / 25.4, height = 170 / 25.4)
+```
+
+# Figure 2
+
+```{r fig2-compute}
+# Bao's CV (rarefied to N=20), pooled per species x composition across replicate pots
+normalized_data <- normalize_0_1(tda, single_traits)
+normalized_data <- na.omit(normalized_data[, c("CRichGroup", "sp", single_traits)])
+
+singleTraitITV <- aggregate(normalized_data[single_traits],
+                             by = list(normalized_data$CRichGroup, normalized_data$sp), Sample_CV, 20)
+names(singleTraitITV)[1:2] <- c("CRichGroup", "sp")
+sp_itv <- singleTraitITV
+sp_itv$Richness <- substr(sp_itv$CRichGroup, 5, 5)
+sp_itv$Group <- substr(sp_itv$CRichGroup, 8, 8)
+sp_itv$Comp <- substr(sp_itv$CRichGroup, 2, 2)
+mean_phydist_da <- tda %>% distinct(CRichGroup, mean_phydist) %>% rename(RG = CRichGroup)
+sp_itv <- merge(sp_itv, mean_phydist_da, by.x = "CRichGroup", by.y = "RG", all.x = TRUE)
+sp_itv <- sp_itv %>% select(sp, Comp, CRichGroup, mean_phydist, Richness, all_of(single_traits))
+
+sp_itv_long1 <- gather(sp_itv, trait, ITV, all_of(single_traits)) %>%
+  mutate(Comp = as.factor(Comp),
+         trait = factor(trait, levels = single_traits),
+         Richness = as.numeric(Richness),
+         log_Richness = log(Richness))
+```
+
+```{r fig2-model-and-plot, fig.width=9, fig.height=7}
+effect_list <- list()
+significance_list <- list()
+re_selection_log <- list()   # tracks whether (1|CRichGroup) was retained per trait
+for (trait in single_traits) {
+  data.trait <- sp_itv_long1[sp_itv_long1$trait == trait, ]
+  if (nrow(data.trait) == 0) next
+  sel <- select_richness_re(data.trait, "ITV")
+  model.itv <- do.call(lmer, list(formula = sel$formula, data = data.trait, REML = TRUE))
+  eff <- allEffects(model.itv)$`log(Richness)`
+  effect_list[[trait]] <- data.frame(logRichness = eff$x, ITV = eff$fit, upper = eff$upper, lower = eff$lower, Trait = trait)
+  significance_list[[trait]] <- summary(model.itv)$coefficients["log(Richness)", "Pr(>|t|)"]
+  re_selection_log[[trait]] <- data.frame(Trait = trait, used_CRichGroup = sel$used_composition,
+                                           lrt_p = sel$lrt_p, richness_p = significance_list[[trait]])
+}
+effect_data_all <- do.call(rbind, effect_list)
+
+cat("Random-effects structure selected per trait (Fig. 2):\n")
+print(do.call(rbind, re_selection_log), row.names = FALSE)
+
+plot_list <- list()
+for (trait in single_traits) {
+  trait_data <- effect_data_all[effect_data_all$Trait == trait, ]
+  raw_data <- sp_itv_long1[sp_itv_long1$trait == trait, ]
+  if (nrow(trait_data) == 0 || nrow(raw_data) == 0) next
+
+  p_value <- significance_list[[trait]]
+  is_significant <- p_value < SIG_ALPHA
+  p_label <- format_p_label(p_value)
+
+  plot_list[[trait]] <- ggplot() +
+    geom_jitter(data = raw_data, aes(x = log(Richness), y = ITV, color = sp), width = 0.1, shape = 16, size = 2.5, alpha = 0.6) +
+    geom_ribbon(data = trait_data, aes(x = log(Richness), ymin = lower, ymax = upper), fill = "black", alpha = 0.15, linewidth = 0) +
+    geom_line(data = trait_data, aes(x = log(Richness), y = ITV), color = "black", linewidth = 1.2,
+              linetype = ifelse(is_significant, "solid", "dashed")) +
+    annotate("text", x = max(log(trait_data$Richness), na.rm = TRUE),
+             y = { yr <- range(c(raw_data$ITV, trait_data$upper, trait_data$lower), na.rm = TRUE); yr[1] + 0.9 * diff(yr) },
+             label = p_label, hjust = 1, vjust = 0, size = 10/.pt, parse = TRUE) +
+    common_style + xlab("Richness") + ylab(ITV_YLAB) +
+    scale_x_continuous(breaks = log(c(1, 2, 4, 8)), labels = c(1, 2, 4, 8))
+}
+
+# 11-panel layout: leaf/stem traits (top two rows) then root traits (bottom row)
+trait_order <- c("MLA", "SLA", "LDMC", "LTO", "Chl", "Height", "SSD", "SRL", "RD", "RTD", "SRA")
+clean_axis_theme <- function(p, letter, label, keep_x = FALSE, keep_y_title = FALSE) {
+  p <- p + theme(legend.position = "none") +
+    ggtitle(paste0("(", letter, ") ", label)) +
+    theme(plot.title = element_text(hjust = 0, face = "bold"))
+  if (!keep_x) p <- p + theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+  if (!keep_y_title) p <- p + theme(axis.title.y = element_blank())
+  p
+}
+keep_x_traits <- c("SRL", "RD", "RTD", "SRA")
+keep_y_title_traits <- c("Chl")                # middle row only
+processed_plots <- lapply(seq_along(trait_order), function(i) {
+  tr <- trait_order[i]
+  clean_axis_theme(plot_list[[tr]], letters[i], tr, keep_x = tr %in% keep_x_traits,
+                    keep_y_title = tr %in% keep_y_title_traits)
+})
+names(processed_plots) <- trait_order
+
+fig2_layout <- "
+ABCD
+EFG#
+HIJK
+"
+fig2 <- wrap_plots(processed_plots[trait_order], design = fig2_layout, guides = "collect") &
+  theme(legend.position = "bottom", plot.margin = margin(3, 4, 3, 4, "pt"))
+
+print(fig2)
+
+ggsave("figures/Figure_2.pdf", plot = fig2, width = 170, height = 142, units = "mm", dpi = 600, device = "pdf")
+ggsave("figures/Figure_2.png", plot = fig2, width = 170, height = 142, units = "mm", dpi = 600, device = grDevices::png)
+topptx(fig2, filename = "figures/Figure_2.pptx", width = 170 / 25.4, height = 142 / 25.4)
+```
+
+# Figure 3
+
+```{r fig3a-gini-compute}
+# Gini coefficient (bias-corrected, Weiner & Solbrig 1984): size inequality per pot
+clean_data_gini <- tda %>%
+  filter(Comp %in% c("TRUE", "FALSE")) %>%
+  filter(!is.na(ABM) & ABM > 0 & !is.na(UBM) & UBM > 0 & Richness > 0)
+
+pot_stats <- clean_data_gini %>%
+  group_by(CRichGroup, Richness, pot_ID) %>%
+  summarise(n_ind = n(),
+            gini_raw_ABM = ineq(ABM, type = "Gini"),
+            gini_raw_UBM = ineq(UBM, type = "Gini"), .groups = "drop") %>%
+  filter(n_ind > 1) %>%
+  mutate(Gini_ABM = gini_raw_ABM * (n_ind / (n_ind - 1)),   # small-sample correction (Eq. 2)
+         Gini_UBM = gini_raw_UBM * (n_ind / (n_ind - 1)),
+         log_Richness = log(Richness))
+
+model_abm <- lmer(Gini_ABM ~ log_Richness + (1 | CRichGroup), data = pot_stats)
+model_ubm <- lmer(Gini_UBM ~ log_Richness + (1 | CRichGroup), data = pot_stats)
+
+get_stats_text <- function(model, name, suffix = "") {
+  coefs <- summary(model)$coefficients
+  slope <- coefs["log_Richness", "Estimate"]
+  p_val <- coefs["log_Richness", "Pr(>|t|)"]
+  format_slope_p_label(name, slope, p_val, suffix)
+}
+label_text_abm <- get_stats_text(model_abm, "Aboveground")
+label_text_ubm <- get_stats_text(model_ubm, "Belowground")
+
+# Paired t-test per richness level: is aboveground Gini > belowground Gini?
+t_test_stats <- pot_stats %>%
+  group_by(Richness) %>%
+  summarise(p_val = t.test(Gini_ABM, Gini_UBM, paired = TRUE)$p.value,
+            y_pos_raw = max(c(Gini_ABM, Gini_UBM), na.rm = TRUE), .groups = "drop") %>%
+  mutate(log_Richness = log(Richness),
+         significance = case_when(p_val < 0.001 ~ "***", p_val < 0.01 ~ "**", p_val < 0.05 ~ "*", TRUE ~ "ns"),
+         y_pos = pmin(y_pos_raw * 1.05, 1.03))
+```
+
+```{r fig3-gini-plot, fig.width=8, fig.height=7}
+eff_abm <- as.data.frame(effect("log_Richness", model_abm))
+eff_ubm <- as.data.frame(effect("log_Richness", model_ubm))
+eff_combined <- rbind(mutate(eff_abm, Type = "Aboveground"), mutate(eff_ubm, Type = "Belowground"))
+eff_combined$Type <- factor(eff_combined$Type, levels = c("Aboveground", "Belowground"))
+
+plot_data_long <- pot_stats %>%
+  select(Richness, Gini_ABM, Gini_UBM) %>%
+  pivot_longer(cols = c(Gini_ABM, Gini_UBM), names_to = "Type", values_to = "Gini") %>%
+  mutate(Type = recode(Type, "Gini_ABM" = "Aboveground", "Gini_UBM" = "Belowground"),
+         log_Richness = log(Richness))
+plot_data_long$Type <- factor(plot_data_long$Type, levels = c("Aboveground", "Belowground"))
+
+ann_text <- data.frame(log_Richness = log(1), Gini = c(1.18, 1.1),
+                        label = c(label_text_abm, label_text_ubm),
+                        Type = factor(c("Aboveground", "Belowground"), levels = c("Aboveground", "Belowground")))
+
+dodge_width <- 0.2
+
+# Shared panel builder: boxplot + jitter (+ optional fitted line/ribbon) + P annotation
+build_gini_style_panel <- function(plot_data_long, eff_combined, ann_text, t_test_stats,
+                                    y_label, x_breaks, x_labels, y_limits = NULL, y_breaks = NULL, tag = NULL, hide_x = FALSE,
+                                    show_line = TRUE) {
+  p <- ggplot() +
+    geom_jitter(data = plot_data_long, aes(x = log_Richness, y = Value, color = Type),
+                position = position_jitterdodge(jitter.width = 0.1, dodge.width = dodge_width), size = 2, alpha = 0.4, shape = 16) +
+    geom_boxplot(data = plot_data_long, aes(x = log_Richness, y = Value, group = interaction(Richness, Type), color = Type),
+                 position = position_dodge(width = dodge_width), width = 0.2, alpha = 0, outlier.shape = NA, linewidth = 0.8) +
+    { if (show_line) list(
+        geom_ribbon(data = eff_combined, aes(x = log_Richness, ymin = lower, ymax = upper, fill = Type), alpha = 0.15, show.legend = FALSE),
+        geom_line(data = eff_combined, aes(x = log_Richness, y = fit, color = Type), linewidth = 1.2)
+      ) } +
+    geom_text(data = ann_text, aes(x = log_Richness, y = Value, label = label, color = Type),
+              hjust = 0, vjust = 0.5, size = 10/.pt, show.legend = FALSE, parse = TRUE) +
+    geom_text(data = t_test_stats, aes(x = log_Richness, y = y_pos, label = significance), size = 10/.pt, color = "black") +
+    theme_Publication(base_size = 10) +
+    scale_color_manual(values = compartment_colors, name = "Compartment") +
+    scale_fill_manual(values = compartment_colors, name = "Compartment") +
+    theme(legend.position = "bottom", plot.tag = element_text(size = 11, face = "bold", family = "sans"),
+          plot.margin = margin(3, 4, 3, 4, "pt"),
+          legend.title = element_text(size = 10, face = "bold"),
+          legend.text = element_text(size = 9, face = "plain"),
+          legend.key.size = unit(0.5, "cm"),
+          axis.title = element_text(size = 11, face = "plain"),
+          axis.text = element_text(size = 9, face = "plain", color = "black")) +
+    labs(y = y_label, x = if (hide_x) NULL else "Richness", tag = if (!is.null(tag)) paste0("(", tag, ")") else NULL) +
+    scale_x_continuous(breaks = x_breaks, labels = x_labels)
+  if (!is.null(y_limits)) {
+    p <- p + scale_y_continuous(limits = y_limits, breaks = if (!is.null(y_breaks)) y_breaks else seq(y_limits[1], y_limits[2], 0.2), expand = expansion(mult = c(0.05, 0)))
+  } else {
+    p <- p + scale_y_continuous(expand = expansion(mult = c(0.05, 0.18)))
+  }
+  p
+}
+
+# Gini coefficient panel (Fig. 3, single panel)
+ann_text_a <- ann_text %>% rename(Value = Gini)
+p3a <- build_gini_style_panel(rename(plot_data_long, Value = Gini), eff_combined, ann_text_a, t_test_stats,
+                               "Gini coefficient of biomass inequality", log(c(1, 2, 4, 8)), c("1", "2", "4", "8"),
+                               y_limits = c(0, 1.25), y_breaks = seq(0, 1, 0.2), hide_x = FALSE)
+
+print(p3a)
+ggsave("figures/Figure_3.pdf", plot = p3a, width = 120, height = 100, units = "mm", dpi = 600, device = "pdf")
+ggsave("figures/Figure_3.png", plot = p3a, width = 120, height = 100, units = "mm", dpi = 600, device = grDevices::png)
+topptx(p3a, filename = "figures/Figure_3.pptx", width = 120 / 25.4, height = 100 / 25.4)
+```
+
+# Figure 4
+
+```{r fig4-compute}
+# Within/between-species biomass SS decomposition, per pot
+clean_data <- tda %>%
+  filter(Comp %in% c("TRUE", "FALSE")) %>%
+  filter(!is.na(ABM) & ABM > 0 & !is.na(UBM) & UBM > 0 & Richness > 0) %>%
+  mutate(log_ABM = log(ABM), log_UBM = log(UBM))
+
+sp_level <- clean_data %>%
+  group_by(pot_ID, Richness, CRichGroup, sp) %>%
+  summarise(n_sp = n(),
+            sp_mean_ABM = mean(log_ABM, na.rm = TRUE), sp_mean_UBM = mean(log_UBM, na.rm = TRUE),
+            SSW_sp_ABM = sum((log_ABM - sp_mean_ABM)^2, na.rm = TRUE),
+            SSW_sp_UBM = sum((log_UBM - sp_mean_UBM)^2, na.rm = TRUE), .groups = "drop")
+
+pot_level <- sp_level %>%
+  group_by(pot_ID, Richness, CRichGroup) %>%
+  mutate(n_pot = sum(n_sp), n_sp_pot = n(),
+         grand_mean_ABM = sum(n_sp * sp_mean_ABM) / n_pot,
+         grand_mean_UBM = sum(n_sp * sp_mean_UBM) / n_pot) %>%
+  summarise(df_within = max(n_pot - n_sp_pot), df_between = max(n_sp_pot - 1),
+            SSW_ABM = sum(SSW_sp_ABM, na.rm = TRUE), SSW_UBM = sum(SSW_sp_UBM, na.rm = TRUE),
+            SSB_ABM = sum(n_sp * (sp_mean_ABM - grand_mean_ABM)^2, na.rm = TRUE),
+            SSB_UBM = sum(n_sp * (sp_mean_UBM - grand_mean_UBM)^2, na.rm = TRUE), .groups = "drop") %>%
+  mutate(PropB_ABM = ifelse((SSW_ABM + SSB_ABM) > 0, SSB_ABM / (SSW_ABM + SSB_ABM), NA),
+         PropB_UBM = ifelse((SSW_UBM + SSB_UBM) > 0, SSB_UBM / (SSW_UBM + SSB_UBM), NA),
+         log_Richness = log(Richness))
+
+# Panel (b/c): within-species SS, richness = 1, 2, 4, split by compartment
+intra_wide <- pot_level %>% filter(Richness %in% c(1, 2, 4))
+mod_intra_abm <- lmer(SSW_ABM ~ log_Richness + (1 | CRichGroup), data = intra_wide)
+mod_intra_ubm <- lmer(SSW_UBM ~ log_Richness + (1 | CRichGroup), data = intra_wide)
+eff_intra_abm <- as.data.frame(effect("log_Richness", mod_intra_abm))
+eff_intra_ubm <- as.data.frame(effect("log_Richness", mod_intra_ubm))
+
+# Panel (e/f): between-species variance proportion, richness = 2, 4, 8, split
+# by compartment. NB: at richness=8 each pot has 1 individual/species, so
+# within-pot SSW=0 and PropB is forced to 1 for most such pots (ceiling,
+# not pure biology).
+inter_wide_plot <- pot_level %>% filter(Richness %in% c(2, 4, 8))
+mod_inter_abm <- lmer(PropB_ABM ~ log_Richness + (1 | CRichGroup), data = inter_wide_plot)
+mod_inter_ubm <- lmer(PropB_UBM ~ log_Richness + (1 | CRichGroup), data = inter_wide_plot)
+eff_inter_abm <- as.data.frame(effect("log_Richness", mod_inter_abm))
+eff_inter_ubm <- as.data.frame(effect("log_Richness", mod_inter_ubm))
+```
+
+```{r fig4-plot, fig.width=9, fig.height=8}
+# Single-compartment panel: boxplot + jitter + fitted line/ribbon + Slope/p
+build_single_panel <- function(data, value_col, model, eff_data, color, y_label, x_breaks, x_labels,
+                                y_limits = NULL, y_breaks = NULL, tag, title, hide_x = FALSE, show_y = TRUE) {
+  label <- get_stats_text(model, "")
+  y_range <- range(c(data[[value_col]], eff_data$upper, eff_data$lower), na.rm = TRUE)
+  p_y <- y_range[1] + 0.95 * diff(y_range)
+
+  ggplot() +
+    geom_jitter(data = data, aes(x = log(Richness), y = .data[[value_col]]),
+                width = 0.1, size = 2, alpha = 0.4, shape = 16, color = color) +
+    geom_boxplot(data = data, aes(x = log(Richness), y = .data[[value_col]], group = Richness),
+                 color = color, width = 0.2, alpha = 0, outlier.shape = NA, linewidth = 0.8) +
+    geom_ribbon(data = eff_data, aes(x = log_Richness, ymin = lower, ymax = upper), fill = color, alpha = 0.15) +
+    geom_line(data = eff_data, aes(x = log_Richness, y = fit), color = color, linewidth = 1.2) +
+    annotate("text", x = min(log(data$Richness)), y = p_y, label = label,
+             hjust = 0, vjust = 1, size = 10/.pt, parse = TRUE, color = color) +
+    theme_Publication(base_size = 10) +
+    theme(axis.title = element_text(size = 11, face = "plain"),
+          axis.text = element_text(size = 9, face = "plain", color = "black"),
+          legend.position = "none",
+          plot.title = element_text(hjust = 0, face = "bold", size = 11),
+          plot.margin = margin(3, 4, 3, 4, "pt")) +
+    ggtitle(paste0("(", tag, ") ", title)) +
+    xlab(if (hide_x) NULL else "Richness") +
+    ylab(if (show_y) y_label else NULL) +
+    scale_x_continuous(breaks = x_breaks, labels = x_labels) +
+    { if (!is.null(y_limits)) scale_y_continuous(limits = y_limits, breaks = y_breaks, expand = expansion(mult = c(0.05, 0))) }
+}
+
+p4a <- build_single_panel(intra_wide, "SSW_ABM", mod_intra_abm, eff_intra_abm, unname(compartment_colors["Aboveground"]),
+                           "Within-species SS (log-biomass)", log(c(1, 2, 4)), c("1", "2", "4"),
+                           tag = "a", title = "Aboveground", hide_x = TRUE)
+p4b <- build_single_panel(intra_wide, "SSW_UBM", mod_intra_ubm, eff_intra_ubm, unname(compartment_colors["Belowground"]),
+                           "Within-species SS (log-biomass)", log(c(1, 2, 4)), c("1", "2", "4"),
+                           tag = "b", title = "Belowground", hide_x = TRUE, show_y = FALSE)
+p4c <- build_single_panel(inter_wide_plot, "PropB_ABM", mod_inter_abm, eff_inter_abm, unname(compartment_colors["Aboveground"]),
+                           "Proportion of variance between species", log(c(2, 4, 8)), c("2", "4", "8"),
+                           y_limits = c(0, 1.3), y_breaks = c(0, 0.25, 0.5, 0.75, 1), tag = "c", title = "Aboveground")
+p4d <- build_single_panel(inter_wide_plot, "PropB_UBM", mod_inter_ubm, eff_inter_ubm, unname(compartment_colors["Belowground"]),
+                           "Proportion of variance between species", log(c(2, 4, 8)), c("2", "4", "8"),
+                           y_limits = c(0, 1.3), y_breaks = c(0, 0.25, 0.5, 0.75, 1), tag = "d", title = "Belowground", show_y = FALSE)
+
+fig4_decomp <- (p4a | p4b) / (p4c | p4d) &
+  theme(plot.margin = margin(3, 4, 3, 4, "pt"))
+
+print(fig4_decomp)
+
+ggsave("figures/Figure_4.pdf", plot = fig4_decomp, width = 170, height = 160, units = "mm", dpi = 600, device = "pdf")
+ggsave("figures/Figure_4.png", plot = fig4_decomp, width = 170, height = 160, units = "mm", dpi = 600, device = grDevices::png)
+topptx(fig4_decomp, filename = "figures/Figure_4.pptx", width = 170 / 25.4, height = 160 / 25.4)
+```
+
+# Figure 5
+
+```{r fig5-compute}
+# mean trait value ~ log(Richness) + (1|sp), per trait + PCA axis
+meta_cols <- c("ind_ID", "Richness", "CRichGroup", "sp", "mean_phydist")
+
+data_mean <- tda %>%
+  select(all_of(meta_cols), all_of(single_traits)) %>%
+  left_join(above.tda %>% select(ind_ID, Above_PC1, Above_PC2), by = "ind_ID") %>%
+  left_join(below.tda %>% select(ind_ID, Below_PC1, Below_PC2), by = "ind_ID")
+
+all_mean_traits <- c(single_traits, "Above_PC1", "Above_PC2", "Below_PC1", "Below_PC2")
+
+sp_mean_by_richness_group <- data_mean %>%
+  group_by(Richness, CRichGroup, sp) %>%
+  summarise(across(all_of(all_mean_traits), ~ mean(., na.rm = TRUE)), .groups = "drop") %>%
+  mutate(Richness = as.numeric(Richness)) %>%
+  filter(Richness != 0) %>%
+  mutate(log_Richness = log(Richness))
+
+traits_ordered <- c("LTO", "MLA", "SLA", "LDMC", "SSD", "Chl", "Height",
+                     "Above_PC1", "Above_PC2", "SRL", "RD", "RTD", "SRA", "Below_PC1", "Below_PC2")
+
+results.mean_trait <- data.frame(Trait = traits_ordered, p.value = NA, estimate = NA, error = NA)
+results.mean_trait$Trait <- factor(results.mean_trait$Trait, levels = rev(traits_ordered))
+re_selection_log_fig5 <- list()
+
+for (trait in traits_ordered) {
+  data.trait <- sp_mean_by_richness_group %>%
+    select(Richness, log_Richness, sp, CRichGroup, all_of(trait)) %>%
+    rename(mean_trait_value = trait)
+
+  sel <- select_richness_re(data.trait, "mean_trait_value", richness_term = "log_Richness")
+  re_selection_log_fig5[[trait]] <- data.frame(Trait = trait, used_CRichGroup = sel$used_composition, re_lrt_p = sel$lrt_p)
+
+  model.mean_trait <- do.call(lmer, list(formula = sel$formula, data = data.trait, REML = FALSE))
+  reduced_model <- do.call(lmer, list(formula = sel$null_formula, data = data.trait, REML = FALSE))
+  p_value <- anova(model.mean_trait, reduced_model)[2, "Pr(>Chisq)"]   # LRT
+
+  model.mean_trait <- do.call(lmer, list(formula = sel$formula, data = data.trait, REML = TRUE))
+  coef_summary <- summary(model.mean_trait)$coefficients
+  results.mean_trait[results.mean_trait$Trait == trait, "p.value"] <- p_value
+  results.mean_trait[results.mean_trait$Trait == trait, c("estimate", "error")] <-
+    coef_summary["log_Richness", c("Estimate", "Std. Error")]
+}
+
+cat("Random-effects structure selected per trait (Fig. 5):\n")
+print(do.call(rbind, re_selection_log_fig5), row.names = FALSE)
+
+results.mean_trait$sig <- with(results.mean_trait,
+  factor(ifelse(p.value < 0.05, "p < 0.05", ifelse(p.value < 0.1, "p < 0.10 .", "ns")),
+         levels = c("p < 0.05", "p < 0.10 .", "ns")))
+
+belowground_traits <- c("SRL", "RD", "RTD", "SRA", "Below_PC1", "Below_PC2")
+results.mean_trait$Compartment <- factor(ifelse(results.mean_trait$Trait %in% belowground_traits, "Belowground", "Aboveground"),
+                                          levels = c("Aboveground", "Belowground"))
+write.csv(results.mean_trait, "tables/mean_trait_analysis_results.csv", row.names = FALSE)
+```
+
+```{r fig5-plot, fig.width=6, fig.height=5}
+fig5 <- ggplot(results.mean_trait, aes(x = estimate, y = Trait, color = Compartment, fill = sig)) +
+  geom_vline(xintercept = 0, linetype = 2, color = "grey60", linewidth = 1) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * error, xmax = estimate + 1.96 * error), width = 0.2, linewidth = 0.8) +
+  geom_point(shape = 21, stroke = 1.2, size = 3) +
+  theme_Publication(base_size = 10) +
+  theme(axis.title = element_text(size = 11, face = "plain"),
+        axis.text = element_text(size = 9, face = "plain", color = "black"),
+        legend.position = "bottom",
+        legend.title = element_text(size = 10, face = "bold"),
+        legend.text = element_text(size = 9, face = "plain"),
+        legend.key.size = unit(0.5, "cm"),
+        plot.margin = margin(3, 4, 3, 4, "pt")) +
+  scale_fill_manual(values = c("p < 0.05" = "black", "p < 0.10 ." = "grey80", "ns" = "white"), guide = "none") +
+  scale_color_manual(values = compartment_colors, name = "Compartment") +
+  ylab("Trait") + xlab("Regression coefficients (Richness)")
+
+print(fig5)
+ggsave("figures/Figure_5.pdf", plot = fig5, width = 120, height = 100, units = "mm", dpi = 600, device = "pdf")
+ggsave("figures/Figure_5.png", plot = fig5, width = 120, height = 100, units = "mm", dpi = 600, device = grDevices::png)
+topptx(fig5, filename = "figures/Figure_5.pptx", width = 120 / 25.4, height = 100 / 25.4)
+```
+
+# Table S1
+
+```{r tableS1}
+# log(Richness) x Compartment interaction, pooled across all ITV metrics (z-standardized)
+df_single <- sp_itv_long1 %>%
+  filter(trait %in% single_traits) %>%
+  mutate(Compartment = ifelse(trait %in% above_traits, "Aboveground", "Belowground"),
+         Measure_ID = trait, Value = ITV, Data_Type = "Single_Trait") %>%
+  select(sp, Richness, CRichGroup, Compartment, Measure_ID, Value, Data_Type)
+
+df_pca <- do.call(rbind, lapply(names(all_results_list), function(n) {
+  d <- all_results_list[[n]]; d$Measure_ID <- n; d
+})) %>%
+  mutate(Compartment = ifelse(grepl("Above", Measure_ID), "Aboveground", "Belowground"),
+         Value = Intra_FRic, Data_Type = "PCA_Axis") %>%
+  select(sp, Richness, CRichGroup, Compartment, Measure_ID, Value, Data_Type)
+
+df_multi <- rbind(
+  aboveTPD_FD %>% mutate(Compartment = "Aboveground"),
+  belowTPD_FD %>% mutate(Compartment = "Belowground")
+) %>%
+  mutate(Measure_ID = "Multi_FRic", Value = Intra_FRic, Data_Type = "Multi_Trait") %>%
+  select(sp, Richness, CRichGroup, Compartment, Measure_ID, Value, Data_Type)
+
+df_all_pooled <- rbind(df_single, df_pca, df_multi) %>%
+  group_by(Measure_ID) %>%
+  mutate(Standardized_Value = scale(Value)) %>%
+  ungroup()
+
+sel_pooled <- select_richness_re(df_all_pooled, "Standardized_Value", richness_term = "log(Richness) * Compartment")
+cat("Random-effects structure selected for Table S1 pooled model: used_CRichGroup =",
+    sel_pooled$used_composition, ", LRT P =", signif(sel_pooled$lrt_p, 3), "\n")
+
+model_all_pooled <- do.call(lmer, list(formula = sel_pooled$formula, data = df_all_pooled, REML = TRUE))
+
+anova(model_all_pooled)
+r.squaredGLMM(model_all_pooled)
+```
+
+# Table S2
+
+```{r tableS2}
+# Composition random-effect (LRT) decision per metric, Fig. 1 and Fig. 2
+above_traits_set <- above_traits
+tableS2_multidim <- do.call(rbind, re_selection_log_multidim) %>%
+  rename(Metric = Panel) %>%
+  mutate(Compartment = Metric, Type = "Multidimensional (2-D) ITV")
+
+tableS2_pcaxis <- do.call(rbind, re_selection_log_pcaxis) %>%
+  rename(Metric = Axis) %>%
+  mutate(Compartment = ifelse(grepl("^Above", Metric), "Aboveground", "Belowground"),
+         Type = "PCA-axis (1-D) ITV")
+
+tableS2_singletrait <- do.call(rbind, re_selection_log) %>%
+  rename(Metric = Trait) %>%
+  mutate(Compartment = ifelse(Metric %in% above_traits_set, "Aboveground", "Belowground"),
+         Type = "Single-trait ITV")
+
+tableS2 <- bind_rows(tableS2_multidim, tableS2_pcaxis, tableS2_singletrait) %>%
+  mutate(Composition_included = ifelse(used_CRichGroup, "Yes", "No")) %>%
+  select(Type, Compartment, Metric, LRT_P = lrt_p, Composition_included, Richness_effect_P = richness_p) %>%
+  mutate(across(c(LRT_P, Richness_effect_P), ~ round(., 4)))
+
+print(tableS2, row.names = FALSE)
+write.csv(tableS2, "tables/TableS2_composition_LRT.csv", row.names = FALSE)
+```
+
+# Figure S1
+
+```{r figS1, fig.width=10, fig.height=5.5}
+above_pca_plot <- plot_PCA_biplot(above.tda, pca_summary %>% filter(Compartment == "Aboveground"), "Above_PC1", "Above_PC2", scale_factor = 2) +
+  ggtitle("(a) Aboveground") + common_style + theme(plot.title = element_text(hjust = 0, face = "bold"))
+froot_pca_plot <- plot_PCA_biplot(below.tda, pca_summary %>% filter(Compartment == "Belowground"), "Below_PC1", "Below_PC2", scale_factor = 3) +
+  ggtitle("(b) Belowground") + common_style + theme(plot.title = element_text(hjust = 0, face = "bold"))
+
+figS1 <- above_pca_plot + froot_pca_plot +
+  plot_layout(ncol = 2, guides = "collect") &
+  theme(legend.position = "bottom", legend.box.margin = margin(t = -10, b = 0),
+        plot.margin = margin(3, 4, 3, 4, "pt"))
+
+print(figS1)
+ggsave("figures/Figure_S1.pdf", plot = figS1, width = 170, height = 91, units = "mm", dpi = 600, device = "pdf")
+ggsave("figures/Figure_S1.png", plot = figS1, width = 170, height = 91, units = "mm", dpi = 600, device = grDevices::png)
+topptx(figS1, filename = "figures/Figure_S1.pptx", width = 170 / 25.4, height = 91 / 25.4)
+```
+
+# Figure S2
+
+```{r figS-species-helpers}
+# Per-species lm(response ~ log(Richness)), independent of variance-component estimation
+fit_species_lines <- function(data, response_col, panel_label) {
+  data <- data[!is.na(data[[response_col]]), ]
+  species_list <- sort(unique(data$sp))
+  lines <- list()
+  rows <- list()
+  for (s in species_list) {
+    d <- data[data$sp == s, ]
+    if (nrow(d) < 3 || length(unique(d$Richness)) < 2) next
+    f <- as.formula(paste(response_col, "~ log(Richness)"))
+    m <- lm(f, data = d)
+    sm <- summary(m)
+    p_value <- sm$coefficients[2, 4]
+    r2 <- sm$r.squared
+
+    newx <- data.frame(Richness = seq(min(d$Richness), max(d$Richness), length.out = 50))
+    pred <- predict(m, newdata = newx)
+    lines[[s]] <- data.frame(sp = s, logRichness = log(newx$Richness), fit = pred,
+                              is_significant = p_value < SIG_ALPHA)
+    rows[[s]] <- data.frame(Panel = panel_label, sp = s, N = nrow(d), r_squared = r2, p_value = p_value)
+  }
+  list(lines = if (length(lines)) do.call(rbind, lines) else NULL,
+       points = data.frame(sp = d$sp[0], Richness = numeric(0), value = numeric(0)),
+       table = if (length(rows)) do.call(rbind, rows) else NULL) -> out
+  out$points <- data.frame(sp = data$sp, Richness = data$Richness, value = data[[response_col]])
+  out
+}
+
+plot_species_overlay <- function(fit_result, title, letter, hide_x = FALSE, hide_y = FALSE, show_y_title = TRUE) {
+  p <- ggplot() +
+    geom_jitter(data = fit_result$points, aes(x = log(Richness), y = value, color = sp),
+                width = 0.05, shape = 16, size = 1.8, alpha = 0.5) +
+    geom_line(data = fit_result$lines, aes(x = logRichness, y = fit, color = sp, linetype = is_significant),
+              linewidth = 0.9) +
+    scale_linetype_manual(values = c(`TRUE` = "solid", `FALSE` = "dashed"), guide = "none") +
+    common_style + ggtitle(paste0("(", letter, ") ", title)) +
+    theme(plot.title = element_text(hjust = 0, face = "bold")) +
+    xlab("Richness") + ylab(ITV_YLAB) +
+    scale_x_continuous(breaks = log(c(1, 2, 4, 8)), labels = c(1, 2, 4, 8))
+  if (hide_x) p <- p + theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+  if (hide_y) {
+    p <- p + theme(axis.title.y = element_blank(), axis.text.y = element_blank())
+  } else if (!show_y_title) {
+    p <- p + theme(axis.title.y = element_blank())
+  }
+  p
+}
+```
+
+```{r figS2-compute}
+fit_above_multidim <- fit_species_lines(aboveTPD_FD, "Intra_FRic", "Aboveground")
+fit_below_multidim <- fit_species_lines(belowTPD_FD, "Intra_FRic", "Belowground")
+fit_above_pc1 <- fit_species_lines(all_results_list[["Above_PC1"]], "Intra_FRic", "Above_PC1")
+fit_below_pc1 <- fit_species_lines(all_results_list[["Below_PC1"]], "Intra_FRic", "Below_PC1")
+fit_above_pc2 <- fit_species_lines(all_results_list[["Above_PC2"]], "Intra_FRic", "Above_PC2")
+fit_below_pc2 <- fit_species_lines(all_results_list[["Below_PC2"]], "Intra_FRic", "Below_PC2")
+
+species_slopes_S2 <- rbind(fit_above_multidim$table, fit_below_multidim$table,
+                            fit_above_pc1$table, fit_below_pc1$table,
+                            fit_above_pc2$table, fit_below_pc2$table)
+cat("Per-species richness-ITV fits (multidimensional + PCA-axis FRic):\n")
+print(species_slopes_S2, row.names = FALSE)
+write.csv(species_slopes_S2, "tables/TableS3_species_slopes_multidim_pca.csv", row.names = FALSE)
+```
+
+```{r figS2, fig.width=9, fig.height=11}
+figS2 <- wrap_plots(
+  A = plot_species_overlay(fit_above_multidim, "Aboveground", "a", hide_x = TRUE, show_y_title = FALSE),
+  B = plot_species_overlay(fit_below_multidim, "Belowground", "b", hide_x = TRUE, show_y_title = FALSE),
+  C = plot_species_overlay(fit_above_pc1, "Above_PC1", "c", hide_x = TRUE),
+  D = plot_species_overlay(fit_below_pc1, "Below_PC1", "d", hide_x = TRUE, show_y_title = FALSE),
+  E = plot_species_overlay(fit_above_pc2, "Above_PC2", "e", show_y_title = FALSE),
+  F = plot_species_overlay(fit_below_pc2, "Below_PC2", "f", show_y_title = FALSE),
+  design = "AB\nCD\nEF", guides = "collect"
+) &
+  theme(legend.position = "bottom", plot.margin = margin(3, 4, 3, 4, "pt"))
+
+print(figS2)
+ggsave("figures/Figure_S2.pdf", plot = figS2, width = 170, height = 170, units = "mm", dpi = 600, device = "pdf")
+ggsave("figures/Figure_S2.png", plot = figS2, width = 170, height = 170, units = "mm", dpi = 600, device = grDevices::png)
+topptx(figS2, filename = "figures/Figure_S2.pptx", width = 170 / 25.4, height = 170 / 25.4)
+```
+
+# Figure S3
+
+```{r figS3-compute}
+single_trait_fits <- lapply(trait_order, function(tr) {
+  fit_species_lines(sp_itv_long1[sp_itv_long1$trait == tr, ], "ITV", tr)
+})
+names(single_trait_fits) <- trait_order
+
+species_slopes_S3 <- do.call(rbind, lapply(single_trait_fits, `[[`, "table"))
+cat("Per-species richness-ITV fits (single-trait ITV):\n")
+print(species_slopes_S3, row.names = FALSE)
+write.csv(species_slopes_S3, "tables/TableS3_species_slopes_singletrait.csv", row.names = FALSE)
+```
+
+```{r figS3, fig.width=9, fig.height=7}
+keep_x_traits <- c("SRL", "RD", "RTD", "SRA")
+plots_S3 <- lapply(seq_along(trait_order), function(i) {
+  tr <- trait_order[i]
+  plot_species_overlay(single_trait_fits[[tr]], tr, letters[i],
+                        hide_x = !(tr %in% keep_x_traits),
+                        show_y_title = tr %in% keep_y_title_traits)
+})
+names(plots_S3) <- trait_order
+
+figS3_layout <- "
+ABCD
+EFG#
+HIJK
+"
+figS3 <- wrap_plots(plots_S3[trait_order], design = figS3_layout, guides = "collect") &
+  theme(legend.position = "bottom", plot.margin = margin(3, 4, 3, 4, "pt"))
+
+print(figS3)
+ggsave("figures/Figure_S3.pdf", plot = figS3, width = 170, height = 142, units = "mm", dpi = 600, device = "pdf")
+ggsave("figures/Figure_S3.png", plot = figS3, width = 170, height = 142, units = "mm", dpi = 600, device = grDevices::png)
+topptx(figS3, filename = "figures/Figure_S3.pptx", width = 170 / 25.4, height = 142 / 25.4)
+```
+
+# Appendix: Robustness checks
+
+## A. Paired-organ intersection
+
+```{r robustness-paired-organs, eval=FALSE}
+has_above <- complete.cases(tda[, above_traits])
+has_below <- complete.cases(tda[, fineroot_traits])
+common_ids <- intersect(tda$ind_ID[has_above], tda$ind_ID[has_below])
+
+tda_paired <- tda[tda$ind_ID %in% common_ids, ]
+above.tda_paired <- tda_paired[, colnames(tda_paired) %in% c(
+  "Comp", "Richness", "CRichGroup", "Group", "mean_phydist", "pot_number",
+  "sp", "ind_ID", "pot_ID", "sp_group", above_traits)]
+below.tda_paired <- tda_paired[, colnames(tda_paired) %in% c(
+  "Comp", "Richness", "CRichGroup", "Group", "mean_phydist", "pot_number",
+  "sp", "ind_ID", "pot_ID", "sp_group", fineroot_traits)]
+
+# Re-run Figs 1-2/Table S1 on above.tda_paired / below.tda_paired
+```
+
+## B. Pot-level subsampling
+
+```{r robustness-pot-subsampling, eval=FALSE}
+Sample_CV_between_pot <- function(sub_df, trait_col, pot_col = "pot_ID", N = 20, iterations = 999) {
+  sub_df <- sub_df[!is.na(sub_df[[trait_col]]), ]
+  if (nrow(sub_df) == 0) return(NA)
+  pot_ids <- sub_df[[pot_col]]
+  traits <- sub_df[[trait_col]]
+  unique_pots <- unique(pot_ids)
+  if (length(unique_pots) <= 1) return(NA)   # need >1 pot to estimate between-pot variation
+
+  pot_indices <- split(seq_along(traits), pot_ids)
+  sample_size <- min(length(unique_pots), N)
+
+  cv_results <- replicate(iterations, {
+    sampled_idx <- vapply(pot_indices, function(idx) if (length(idx) == 1) idx else sample(idx, 1), numeric(1))
+    if (length(sampled_idx) > sample_size) sampled_idx <- sample(sampled_idx, sample_size)
+    CV4(traits[sampled_idx])
+  })
+  mean(cv_results, na.rm = TRUE)
+}
+
+# Substitute for Sample_CV() in Fig. 2 to reproduce this check
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
