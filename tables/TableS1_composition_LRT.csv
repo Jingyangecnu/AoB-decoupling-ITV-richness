@@ -16,3 +16,18 @@
 "Single-trait ITV","Belowground","RD",0.9414,"No",0.0282
 "Single-trait ITV","Belowground","RTD",0.0202,"Yes",0.4586
 "Single-trait ITV","Belowground","SRA",1e-04,"Yes",0.5003
+"Species-level mean trait value","Aboveground","LTO",0.6057,"No",0
+"Species-level mean trait value","Aboveground","MLA",0.0025,"Yes",0.0277
+"Species-level mean trait value","Aboveground","SLA",0,"Yes",0.0102
+"Species-level mean trait value","Aboveground","LDMC",0.0324,"Yes",0.0585
+"Species-level mean trait value","Aboveground","SSD",0,"Yes",0.0036
+"Species-level mean trait value","Aboveground","Chl",0.0014,"Yes",0.3915
+"Species-level mean trait value","Aboveground","Height",0.0797,"No",0.2522
+"Species-level mean trait value","Aboveground","Above_PC1",0,"Yes",0.0018
+"Species-level mean trait value","Aboveground","Above_PC2",0.0065,"Yes",0.2974
+"Species-level mean trait value","Belowground","SRL",0.2295,"No",0.0172
+"Species-level mean trait value","Belowground","RD",0.1034,"No",3e-04
+"Species-level mean trait value","Belowground","RTD",0,"Yes",0.9236
+"Species-level mean trait value","Belowground","SRA",8e-04,"Yes",0.3869
+"Species-level mean trait value","Belowground","Below_PC1",0,"Yes",0.7003
+"Species-level mean trait value","Belowground","Below_PC2",0.2996,"No",4e-04

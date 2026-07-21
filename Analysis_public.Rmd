@@ -774,7 +774,6 @@ for (trait in traits_ordered) {
     rename(mean_trait_value = trait)
 
   sel <- select_richness_re(data.trait, "mean_trait_value", richness_term = "log_Richness")
-  re_selection_log_fig5[[trait]] <- data.frame(Trait = trait, used_CRichGroup = sel$used_composition, re_lrt_p = sel$lrt_p)
 
   model.mean_trait <- do.call(lmer, list(formula = sel$formula, data = data.trait, REML = FALSE))
   reduced_model <- do.call(lmer, list(formula = sel$null_formula, data = data.trait, REML = FALSE))
@@ -785,6 +784,11 @@ for (trait in traits_ordered) {
   results.mean_trait[results.mean_trait$Trait == trait, "p.value"] <- p_value
   results.mean_trait[results.mean_trait$Trait == trait, c("estimate", "error")] <-
     coef_summary["log_Richness", c("Estimate", "Std. Error")]
+
+  # Wald t-test P-value for log(Richness), consistent with the statistic
+  # reported for all other metrics in Table S1.
+  re_selection_log_fig5[[trait]] <- data.frame(Trait = trait, used_CRichGroup = sel$used_composition,
+                                                lrt_p = sel$lrt_p, richness_p = coef_summary["log_Richness", "Pr(>|t|)"])
 }
 
 cat("Random-effects structure selected per trait (Fig. 5):\n")
@@ -842,7 +846,12 @@ tableS1_singletrait <- do.call(rbind, re_selection_log) %>%
   mutate(Compartment = ifelse(Metric %in% above_traits_set, "Aboveground", "Belowground"),
          Type = "Single-trait ITV")
 
-tableS1 <- bind_rows(tableS1_multidim, tableS1_pcaxis, tableS1_singletrait) %>%
+tableS1_meantrait <- do.call(rbind, re_selection_log_fig5) %>%
+  rename(Metric = Trait) %>%
+  mutate(Compartment = ifelse(Metric %in% belowground_traits, "Belowground", "Aboveground"),
+         Type = "Species-level mean trait value")
+
+tableS1 <- bind_rows(tableS1_multidim, tableS1_pcaxis, tableS1_singletrait, tableS1_meantrait) %>%
   mutate(Composition_included = ifelse(used_CRichGroup, "Yes", "No")) %>%
   select(Type, Compartment, Metric, LRT_P = lrt_p, Composition_included, Richness_effect_P = richness_p) %>%
   mutate(across(c(LRT_P, Richness_effect_P), ~ round(., 4)))
