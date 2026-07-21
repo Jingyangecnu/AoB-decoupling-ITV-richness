@@ -29,6 +29,9 @@ private raw dataset.
 
 ```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
 knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+# Fixes the Monte Carlo resampling in Sample_CV() (single-trait ITV, Fig. 2)
+# so every render reproduces identical values.
+set.seed(42)
 ```
 
 ## Packages
@@ -823,6 +826,34 @@ topptx(fig5, filename = "figures/Figure_5.pptx", width = 120 / 25.4, height = 10
 # Table S1
 
 ```{r tableS1}
+# Composition random-effect (LRT) decision per metric, Fig. 1 and Fig. 2
+above_traits_set <- above_traits
+tableS1_multidim <- do.call(rbind, re_selection_log_multidim) %>%
+  rename(Metric = Panel) %>%
+  mutate(Compartment = Metric, Type = "Multidimensional (2-D) ITV")
+
+tableS1_pcaxis <- do.call(rbind, re_selection_log_pcaxis) %>%
+  rename(Metric = Axis) %>%
+  mutate(Compartment = ifelse(grepl("^Above", Metric), "Aboveground", "Belowground"),
+         Type = "PCA-axis (1-D) ITV")
+
+tableS1_singletrait <- do.call(rbind, re_selection_log) %>%
+  rename(Metric = Trait) %>%
+  mutate(Compartment = ifelse(Metric %in% above_traits_set, "Aboveground", "Belowground"),
+         Type = "Single-trait ITV")
+
+tableS1 <- bind_rows(tableS1_multidim, tableS1_pcaxis, tableS1_singletrait) %>%
+  mutate(Composition_included = ifelse(used_CRichGroup, "Yes", "No")) %>%
+  select(Type, Compartment, Metric, LRT_P = lrt_p, Composition_included, Richness_effect_P = richness_p) %>%
+  mutate(across(c(LRT_P, Richness_effect_P), ~ round(., 4)))
+
+print(tableS1, row.names = FALSE)
+write.csv(tableS1, "tables/TableS1_composition_LRT.csv", row.names = FALSE)
+```
+
+# Table S2
+
+```{r tableS2}
 # log(Richness) x Compartment interaction, pooled across all ITV metrics (z-standardized)
 df_single <- sp_itv_long1 %>%
   filter(trait %in% single_traits) %>%
@@ -850,41 +881,22 @@ df_all_pooled <- rbind(df_single, df_pca, df_multi) %>%
   ungroup()
 
 sel_pooled <- select_richness_re(df_all_pooled, "Standardized_Value", richness_term = "log(Richness) * Compartment")
-cat("Random-effects structure selected for Table S1 pooled model: used_CRichGroup =",
+cat("Random-effects structure selected for Table S2 pooled model: used_CRichGroup =",
     sel_pooled$used_composition, ", LRT P =", signif(sel_pooled$lrt_p, 3), "\n")
 
 model_all_pooled <- do.call(lmer, list(formula = sel_pooled$formula, data = df_all_pooled, REML = TRUE))
 
 anova(model_all_pooled)
 r.squaredGLMM(model_all_pooled)
-```
 
-# Table S2
-
-```{r tableS2}
-# Composition random-effect (LRT) decision per metric, Fig. 1 and Fig. 2
-above_traits_set <- above_traits
-tableS2_multidim <- do.call(rbind, re_selection_log_multidim) %>%
-  rename(Metric = Panel) %>%
-  mutate(Compartment = Metric, Type = "Multidimensional (2-D) ITV")
-
-tableS2_pcaxis <- do.call(rbind, re_selection_log_pcaxis) %>%
-  rename(Metric = Axis) %>%
-  mutate(Compartment = ifelse(grepl("^Above", Metric), "Aboveground", "Belowground"),
-         Type = "PCA-axis (1-D) ITV")
-
-tableS2_singletrait <- do.call(rbind, re_selection_log) %>%
-  rename(Metric = Trait) %>%
-  mutate(Compartment = ifelse(Metric %in% above_traits_set, "Aboveground", "Belowground"),
-         Type = "Single-trait ITV")
-
-tableS2 <- bind_rows(tableS2_multidim, tableS2_pcaxis, tableS2_singletrait) %>%
-  mutate(Composition_included = ifelse(used_CRichGroup, "Yes", "No")) %>%
-  select(Type, Compartment, Metric, LRT_P = lrt_p, Composition_included, Richness_effect_P = richness_p) %>%
-  mutate(across(c(LRT_P, Richness_effect_P), ~ round(., 4)))
-
-print(tableS2, row.names = FALSE)
-write.csv(tableS2, "tables/TableS2_composition_LRT.csv", row.names = FALSE)
+# Per-predictor coefficient table (Estimate/SE/df/t/P), exported so manuscript
+# Table S2 is transcribed directly from this file rather than by hand.
+tableS2_coefs <- as.data.frame(summary(model_all_pooled)$coefficients)
+tableS2_coefs <- cbind(Predictor = rownames(tableS2_coefs), tableS2_coefs)
+rownames(tableS2_coefs) <- NULL
+names(tableS2_coefs) <- c("Predictor", "Estimate", "Std_Error", "df", "t_value", "P_value")
+print(tableS2_coefs, row.names = FALSE)
+write.csv(tableS2_coefs, "tables/TableS2_coefficients.csv", row.names = FALSE)
 ```
 
 # Figure S1
@@ -921,6 +933,8 @@ fit_species_lines <- function(data, response_col, panel_label) {
     f <- as.formula(paste(response_col, "~ log(Richness)"))
     m <- lm(f, data = d)
     sm <- summary(m)
+    slope <- sm$coefficients[2, 1]
+    slope_se <- sm$coefficients[2, 2]
     p_value <- sm$coefficients[2, 4]
     r2 <- sm$r.squared
 
@@ -928,7 +942,8 @@ fit_species_lines <- function(data, response_col, panel_label) {
     pred <- predict(m, newdata = newx)
     lines[[s]] <- data.frame(sp = s, logRichness = log(newx$Richness), fit = pred,
                               is_significant = p_value < SIG_ALPHA)
-    rows[[s]] <- data.frame(Panel = panel_label, sp = s, N = nrow(d), r_squared = r2, p_value = p_value)
+    rows[[s]] <- data.frame(Panel = panel_label, sp = s, N = nrow(d), slope = slope, slope_se = slope_se,
+                             r_squared = r2, p_value = p_value)
   }
   list(lines = if (length(lines)) do.call(rbind, lines) else NULL,
        points = data.frame(sp = d$sp[0], Richness = numeric(0), value = numeric(0)),
