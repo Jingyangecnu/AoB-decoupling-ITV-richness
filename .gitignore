@@ -22,6 +22,7 @@ figures/Final_figs.pptx
 figures/Figure_S2_observed_vs_randomized.*
 figures/Figure_S2_permutation_adjusted.*
 tables/TableS3_*.csv
+tables/TableS1_composition_LRT.csv
 tables/mean_trait_analysis_results.csv
 tables/FigureS2_*
 tables/ModelSummary_*

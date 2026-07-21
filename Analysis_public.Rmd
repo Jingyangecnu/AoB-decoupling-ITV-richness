@@ -858,6 +858,18 @@ tableS1 <- bind_rows(tableS1_multidim, tableS1_pcaxis, tableS1_singletrait, tabl
 
 print(tableS1, row.names = FALSE)
 write.csv(tableS1, "tables/TableS1_composition_LRT.csv", row.names = FALSE)
+
+# Publication-formatted version: fixed 3 decimals, "<0.001" for very small
+# P-values, and a non-redundant Metric label for the two multidimensional
+# ITV rows (their Metric otherwise just repeats the Compartment column).
+format_p <- function(p) ifelse(p < 0.001, "<0.001", sprintf("%.3f", p))
+tableS1_manuscript <- tableS1 %>%
+  mutate(Metric = ifelse(Type == "Multidimensional (2-D) ITV", "TPD FRic (all traits)", Metric),
+         LRT_P = format_p(LRT_P),
+         Richness_effect_P = format_p(Richness_effect_P)) %>%
+  rename(`ITV type` = Type, `LRT P` = LRT_P, `Composition retained` = Composition_included,
+         `Richness effect P` = Richness_effect_P)
+write.csv(tableS1_manuscript, "tables/TableS1_manuscript.csv", row.names = FALSE)
 ```
 
 # Table S2
