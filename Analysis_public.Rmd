@@ -775,20 +775,17 @@ for (trait in traits_ordered) {
 
   sel <- select_richness_re(data.trait, "mean_trait_value", richness_term = "log_Richness")
 
-  model.mean_trait <- do.call(lmer, list(formula = sel$formula, data = data.trait, REML = FALSE))
-  reduced_model <- do.call(lmer, list(formula = sel$null_formula, data = data.trait, REML = FALSE))
-  p_value <- anova(model.mean_trait, reduced_model)[2, "Pr(>Chisq)"]   # LRT
-
   model.mean_trait <- do.call(lmer, list(formula = sel$formula, data = data.trait, REML = TRUE))
   coef_summary <- summary(model.mean_trait)$coefficients
-  results.mean_trait[results.mean_trait$Trait == trait, "p.value"] <- p_value
+  # Wald t-test P-value for log(Richness): used both for the significance
+  # fill in the plot and for Table S1, so the two stay consistent.
+  wald_p <- coef_summary["log_Richness", "Pr(>|t|)"]
+  results.mean_trait[results.mean_trait$Trait == trait, "p.value"] <- wald_p
   results.mean_trait[results.mean_trait$Trait == trait, c("estimate", "error")] <-
     coef_summary["log_Richness", c("Estimate", "Std. Error")]
 
-  # Wald t-test P-value for log(Richness), consistent with the statistic
-  # reported for all other metrics in Table S1.
   re_selection_log_fig5[[trait]] <- data.frame(Trait = trait, used_CRichGroup = sel$used_composition,
-                                                lrt_p = sel$lrt_p, richness_p = coef_summary["log_Richness", "Pr(>|t|)"])
+                                                lrt_p = sel$lrt_p, richness_p = wald_p)
 }
 
 cat("Random-effects structure selected per trait (Fig. 5):\n")
